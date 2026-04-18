@@ -1,0 +1,79 @@
+{
+  "name": "@primeta.ai/openclaw-plugin-primeta",
+  "version": "0.0.1",
+  "description": "OpenClaw channel plugin that bridges Primeta's avatar UI with an OpenClaw agent",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "bin": {
+    "openclaw-primeta": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "dev": "tsc -p tsconfig.json --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "license": "MIT",
+  "author": {
+    "name": "Primeta",
+    "url": "https://primeta.ai"
+  },
+  "homepage": "https://primeta.ai/bridge/setup",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Primeta-AI/openclaw-plugin-primeta.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Primeta-AI/openclaw-plugin-primeta/issues"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "primeta-plugin",
+    "primeta",
+    "avatar",
+    "vrm",
+    "ai"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.7.0"
+  },
+  "openclaw": {
+    "extensions": ["./dist/index.js"],
+    "channels": ["primeta"],
+    "channel": {
+      "id": "primeta",
+      "label": "Primeta",
+      "selectionLabel": "Primeta (Avatar)",
+      "blurb": "Route OpenClaw agent conversations through a Primeta avatar.",
+      "order": 90,
+      "aliases": ["pm"]
+    }
+  }
+}
