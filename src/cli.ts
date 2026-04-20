@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Standalone entry for `npx @primeta.ai/openclaw-plugin-primeta init` (or the
+// Standalone entry for `npx openclaw-plugin-primeta init` (or the
 // `openclaw-primeta` bin from a global install). The exact same setup
 // logic is also exposed via `openclaw primeta init` when the plugin is
 // loaded — see `index.ts` and `setup-runtime.ts`.

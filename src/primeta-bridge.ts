@@ -73,7 +73,7 @@ export class PrimetaBridge {
 
     let ws: WebSocket;
     try {
-      ws = new WebSocket(this.wsUrl());
+      ws = new WebSocket(this.wsUrl(), { headers: { Origin: this.origin() } });
     } catch (err) {
       this.log("error", `WebSocket construction failed: ${(err as Error).message}`);
       this.scheduleReconnect();
@@ -208,6 +208,14 @@ export class PrimetaBridge {
   private wsUrl(): string {
     const base = this.opts.serverUrl.replace(/\/$/, "").replace(/^http/, "ws");
     return `${base}/cable?bridge_token=${encodeURIComponent(this.opts.apiKey)}`;
+  }
+
+  // Rails' ActionCable enforces `allowed_request_origins` in production.
+  // Node's `ws` client does not set an `Origin` header by default, which
+  // Rails treats as a CSRF failure and rejects with 404. Send an origin
+  // derived from `serverUrl` so same-origin handshakes succeed.
+  private origin(): string {
+    return this.opts.serverUrl.replace(/\/$/, "");
   }
 
   private scheduleReconnect(): void {

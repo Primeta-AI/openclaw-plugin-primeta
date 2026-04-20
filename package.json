@@ -1,6 +1,6 @@
 {
-  "name": "@primeta.ai/openclaw-plugin-primeta",
-  "version": "0.0.1",
+  "name": "openclaw-plugin-primeta",
+  "version": "0.0.2",
   "description": "OpenClaw channel plugin that bridges Primeta's avatar UI with an OpenClaw agent",
   "type": "module",
   "main": "dist/index.js",
@@ -18,7 +18,9 @@
     "dist",
     "openclaw.plugin.json",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "*.png",
+    "*.gif"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
@@ -74,6 +76,14 @@
       "blurb": "Route OpenClaw agent conversations through a Primeta avatar.",
       "order": 90,
       "aliases": ["pm"]
+    },
+    "compat": {
+      "pluginApi": ">=2026.4.15",
+      "minGatewayVersion": ">=2026.4.15"
+    },
+    "build": {
+      "openclawVersion": "2026.4.15",
+      "pluginSdkVersion": "2026.4.15"
     }
   }
 }

@@ -2,7 +2,7 @@
 
 OpenClaw channel plugin that routes your agent's conversations through a [Primeta](https://primeta.ai) 3D avatar. Users chat with an animated persona in the browser; replies come from your locally-hosted OpenClaw agent (Kimi, Claude, GPT, Llama, etc.) speaking in the selected persona's voice.
 
-![image-coming-soon](https://via.placeholder.com/800x200/111111/ececea?text=+)
+![Opening a Primeta channel from OpenClaw and chatting with the avatar](https://raw.githubusercontent.com/Primeta-AI/openclaw-plugin-primeta/v0.0.2/openclaw-primeta.gif)
 
 ## What it does
 
@@ -11,28 +11,21 @@ OpenClaw channel plugin that routes your agent's conversations through a [Primet
 - **Proactive avatar speech.** `outbound.sendText` from the agent pushes an unprompted message to the avatar.
 - **Local HTTP surface.** A `/primeta` HTTP+SSE endpoint lets standalone clients (desktop apps, test tools) talk to your OpenClaw agent over a streaming OpenAI-compatible interface.
 
+![Primeta persona library](https://raw.githubusercontent.com/Primeta-AI/openclaw-plugin-primeta/v0.0.2/persona-library.png)
+
 ## Install
 
 ```bash
-clawhub install openclaw-plugin-primeta
-openclaw primeta init --token YOUR_BRIDGE_API_TOKEN --name my-project
+openclaw plugins install clawhub:openclaw-plugin-primeta
+openclaw primeta init --token YOUR_PRIMETA_API_TOKEN --name my-project
 openclaw restart
 ```
 
-Get your bridge API token from **[primeta.ai/bridge/setup](https://primeta.ai/bridge/setup) → Settings → Connections**. The `init` command merges the Primeta channel block into your existing `~/.openclaw/openclaw.json` (backing up the original) and adds the plugin to `plugins.allow`.
+Get your Primeta API token from **[primeta.ai/settings](https://primeta.ai/settings)** → Token Authentication. The `init` command merges the Primeta channel block into your existing `~/.openclaw/openclaw.json` (backing up the original) and adds the plugin to `plugins.allow`.
 
-`--name` labels the bridge inside Primeta — one conversation in the Primeta UI maps to one bridge name. Use a different name for each project.
+`--name` labels the channel inside Primeta — one conversation in the Primeta UI maps to one channel name. Use a different name for each project.
 
 Other flags: `--server` (default `https://primeta.ai`), `--config` (default `~/.openclaw/openclaw.json`), `--path <dir>` (load the plugin from a local directory instead of the installed package — for development), `--force` (overwrite an existing Primeta block without prompting).
-
-### Install via npm (alternative)
-
-```bash
-npm install -g @primeta.ai/openclaw-plugin-primeta
-npx @primeta.ai/openclaw-plugin-primeta init --token YOUR_BRIDGE_API_TOKEN --name my-project
-```
-
-Both install paths share the same setup logic. Use whichever matches how you already manage OpenClaw plugins.
 
 ### Hand-edit instead
 
@@ -44,7 +37,7 @@ Merge the following into your `~/.openclaw/openclaw.json`:
     "primeta": {
       "enabled": true,
       "serverUrl": "https://primeta.ai",
-      "apiKey": "YOUR_BRIDGE_API_TOKEN",
+      "apiKey": "YOUR_PRIMETA_API_TOKEN",
       "bridgeName": "my-project"
     }
   },
@@ -55,7 +48,9 @@ Merge the following into your `~/.openclaw/openclaw.json`:
 }
 ```
 
-Restart the OpenClaw gateway after configuring. An **OpenClaw** bridge card will appear on your Primeta dashboard within a few seconds.
+Restart the OpenClaw gateway after configuring. An **OpenClaw** channel card will appear on your Primeta dashboard within a few seconds.
+
+![OpenClaw channel card on the Primeta dashboard](https://raw.githubusercontent.com/Primeta-AI/openclaw-plugin-primeta/v0.0.2/connection_card.png)
 
 ## How it works
 
@@ -65,7 +60,7 @@ Restart the OpenClaw gateway after configuring. An **OpenClaw** bridge card will
                                         └── HTTP /primeta ◄──── standalone client
 ```
 
-The plugin dials out from the OpenClaw gateway to Primeta — Primeta runs remotely, so it can't reach your local gateway directly. Authentication uses the bridge API token you pass to `init`.
+The plugin dials out from the OpenClaw gateway to Primeta — Primeta runs remotely, so it can't reach your local gateway directly. Authentication uses the Primeta API token you pass to `init`.
 
 When Primeta forwards a user message, the plugin runs one turn through OpenClaw's reply pipeline (`dispatchReplyWithBufferedBlockDispatcher`), buffers the output, and sends a single reply frame back over the socket. Personas are injected as a cacheable system-prompt prefix via the `before_prompt_build` hook, so the agent stays in character across turns without re-shipping the full personality on every message.
 
@@ -144,8 +139,8 @@ data: [DONE]
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `serverUrl` | string (URL) | yes | Primeta server URL. Default `https://primeta.ai`. |
-| `apiKey` | string | yes | Bridge API token from Primeta Settings → Connections. |
-| `bridgeName` | string | no | Conversation label in Primeta. One conversation per bridge name. Default `default`. |
+| `apiKey` | string | yes | Primeta API token from Primeta Settings → Token Authentication. |
+| `bridgeName` | string | no | Channel name — the label shown on the Primeta dashboard. One conversation per channel name. (Field name is `bridgeName` for wire-protocol compatibility.) Default `default`. |
 | `enabled` | boolean | no | Default `true`. Set `false` to temporarily disable without removing the block. |
 
 ## Development
@@ -182,3 +177,4 @@ openclaw primeta init --token <TOKEN> --name test --path /path/to/local/checkout
 ## License
 
 MIT
+

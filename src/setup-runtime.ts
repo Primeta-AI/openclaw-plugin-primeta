@@ -7,7 +7,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync } from
 import { dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 
-export const PACKAGE_NAME = "@primeta.ai/openclaw-plugin-primeta";
+export const PACKAGE_NAME = "openclaw-plugin-primeta";
 export const CHANNEL_ID = "primeta";
 export const DEFAULT_SERVER = "https://primeta.ai";
 export const DEFAULT_CONFIG = "~/.openclaw/openclaw.json";
