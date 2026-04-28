@@ -42,10 +42,20 @@ export interface PrimetaBridgeOptions {
 const INITIAL_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
 
+// Heartbeat watchdog — Rails ActionCable pings every ~3s. If we don't see
+// any inbound frame for this long, we assume the underlying TCP connection
+// is silently dead (laptop sleep, NAT drop, WiFi switch) and force a
+// reconnect. Without this, ws.readyState stays OPEN forever even though
+// no bytes are flowing, and the user has to manually restart.
+const HEARTBEAT_TIMEOUT_MS = 15_000;
+const HEARTBEAT_CHECK_INTERVAL_MS = 5_000;
+
 export class PrimetaBridge {
   private ws: WebSocket | null = null;
   private reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private lastInboundAt = 0;
   private reconnecting = false;
   private closed = false;
   private subscribed = false;
@@ -83,14 +93,20 @@ export class PrimetaBridge {
 
     ws.on("open", () => {
       this.log("info", `Connected to ${this.opts.serverUrl}`);
+      this.lastInboundAt = Date.now();
+      this.startHeartbeatWatchdog();
       ws.send(JSON.stringify({ command: "subscribe", identifier: this.channelIdentifier }));
     });
 
-    ws.on("message", (data: WebSocket.Data) => this.handleFrame(data));
+    ws.on("message", (data: WebSocket.Data) => {
+      this.lastInboundAt = Date.now();
+      this.handleFrame(data);
+    });
 
     ws.on("close", () => {
       this.subscribed = false;
       this.log("info", "Disconnected from Primeta");
+      this.stopHeartbeatWatchdog();
       this.opts.onDisconnected?.();
       this.ws = null;
       if (!this.closed) this.scheduleReconnect();
@@ -109,11 +125,36 @@ export class PrimetaBridge {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.stopHeartbeatWatchdog();
     if (this.ws) {
       try { this.ws.close(); } catch {}
       this.ws = null;
     }
     this.subscribed = false;
+  }
+
+  private startHeartbeatWatchdog(): void {
+    this.stopHeartbeatWatchdog();
+    this.heartbeatTimer = setInterval(() => {
+      const idle = Date.now() - this.lastInboundAt;
+      if (idle <= HEARTBEAT_TIMEOUT_MS) return;
+      this.log("warn", `No frames for ${Math.round(idle / 1000)}s — connection is dead, forcing reconnect`);
+      this.stopHeartbeatWatchdog();
+      if (this.ws) {
+        try { this.ws.terminate?.(); } catch {}
+        try { this.ws.close(); } catch {}
+        this.ws = null;
+      }
+      if (!this.closed) this.scheduleReconnect();
+    }, HEARTBEAT_CHECK_INTERVAL_MS);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private stopHeartbeatWatchdog(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
   }
 
   sendToServer(msg: Record<string, unknown>): boolean {
