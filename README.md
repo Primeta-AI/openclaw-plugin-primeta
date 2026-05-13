@@ -64,6 +64,16 @@ The plugin dials out from the OpenClaw gateway to Primeta — Primeta runs remot
 
 When Primeta forwards a user message, the plugin runs one turn through OpenClaw's reply pipeline (`dispatchReplyWithBufferedBlockDispatcher`), buffers the output, and sends a single reply frame back over the socket. Personas are injected as a cacheable system-prompt prefix via the `before_prompt_build` hook, so the agent stays in character across turns without re-shipping the full personality on every message.
 
+## Companion X/Twitter workflow
+
+Primeta gives an OpenClaw agent an avatar chat surface. If the same agent also needs public X/Twitter automation, install [TweetClaw](https://github.com/Xquik-dev/tweetclaw) beside it:
+
+```bash
+openclaw plugins install @xquik/tweetclaw
+```
+
+Use Primeta for avatar conversations, persona switching, TTS playback, proactive avatar speech, and local `/primeta` HTTP+SSE clients. Use TweetClaw for search tweets, search tweet replies, follower export, user lookup, post tweets, post tweet replies, media upload/download, direct messages, monitor tweets, webhooks, and giveaway draws. Keep Primeta API tokens under `channels.primeta`; keep TweetClaw/Xquik credentials in TweetClaw's plugin config or host environment. Visible X/Twitter writes should still go through OpenClaw approval.
+
 ## Protocol
 
 All messages flow over a single authenticated WebSocket between Primeta and the plugin. Frames are JSON.
@@ -177,4 +187,3 @@ openclaw primeta init --token <TOKEN> --name test --path /path/to/local/checkout
 ## License
 
 MIT
-
