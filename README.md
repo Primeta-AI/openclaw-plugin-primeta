@@ -109,19 +109,35 @@ On the first turn of a session, the plugin prepends the `personality` to the use
 
 The plugin refreshes its cached personality and dispatches a short "greet as new persona" turn so the LLM adopts the switch in conversation history rather than drifting back to the prior character.
 
+**`reply_ack`** — the server's verdict on a `reply` frame.
+
+```json
+{ "type": "reply_ack", "messageId": "42", "status": "ok", "reason": "optional" }
+```
+
+- `ok` — reply saved; the plugin drops it from its outbox.
+- `rejected` — terminal (expired, duplicate, unknown id, wrong bridge); the plugin drops it and does **not** re-send it as a `send`.
+- `retry` — transient server-side failure; the plugin resends the same `reply` (same `messageId`) after a backoff (1s, 2s, 4s … capped at 30s; at most 10 attempts).
+
 ### Plugin → Primeta
 
-**`reply`** — buffered response to a `chat_message`. One frame per `messageId`.
+**`reply`** — buffered response to a `chat_message`, correlated by `messageId`.
 
 ```json
 { "type": "reply", "messageId": "pm-...", "text": "<full response>" }
 ```
+
+Replies go through a durable outbox, deduplicated by `messageId` (the first reply for an id wins). A reply stays in the outbox until the server answers `reply_ack` `ok` or `rejected`. It is flushed, with the same `messageId`, after every `confirm_subscription`, so replies produced while offline or lost in a disconnect are delivered after the reconnect. If no `reply_ack` arrives within 15s and the server has acked replies before, the plugin resends the reply. A server that predates `reply_ack` never acks, so against it the plugin treats an unacked reply as delivered after 15s and does not resend it (resending would post it twice).
+
+The outbox is persisted to `~/.openclaw/primeta/outbox-<accountId>.json` (mode 0600, because it holds reply text). Set `outboxPath` to change the location. Entries older than 24h are discarded on load. If the file can't be written, the outbox keeps working in memory and logs a warning.
 
 **`send`** — proactive agent message, not tied to a user turn. Fires when the agent calls `outbound.sendText`, or as part of the persona-switch greeting.
 
 ```json
 { "type": "send", "text": "...", "bridgeName": "my-project" }
 ```
+
+If the socket is down, `send` frames are held in memory (at most 20) and sent after the next subscribe. They are not persisted.
 
 ### Local HTTP client → plugin
 
@@ -151,6 +167,7 @@ data: [DONE]
 | `apiKey` | string | yes | Primeta API token from Primeta Settings → Token Authentication. |
 | `bridgeName` | string | no | Channel name — the label shown on the Primeta dashboard. One conversation per channel name. (Field name is `bridgeName` for wire-protocol compatibility.) Default `default`. |
 | `enabled` | boolean | no | Default `true`. Set `false` to temporarily disable without removing the block. |
+| `outboxPath` | string | no | Reply outbox file. Default `~/.openclaw/primeta/outbox-<accountId>.json`. |
 
 ## Development
 
@@ -160,7 +177,8 @@ Local source tree:
 src/
 ├── index.ts            # Plugin entry: registerChannel + before_prompt_build hook + registerCli
 ├── channel.ts          # ChannelPlugin (config, outbound, gateway.startAccount, status)
-├── primeta-bridge.ts   # WebSocket client + reconnection
+├── primeta-bridge.ts   # WebSocket client + reconnection + reply delivery
+├── outbox.ts           # Durable reply outbox (JSON file, dedup by messageId)
 ├── inbound.ts          # chat_message → dispatch → buffered reply
 ├── persona-switch.ts   # Synthetic greeting on persona_update
 ├── dispatch.ts         # Shared agent dispatch helper (resolveRoute + finalizeCtx + dispatcher)

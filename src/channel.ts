@@ -2,18 +2,22 @@
 // resolution from the user's `channels.primeta` config block, opens the
 // per-account ActionCable connection inside `gateway.startAccount`, and
 // routes `outbound.sendText` calls from the agent through the bridge as
-// `{type: "send"}` frames.
+// `{type: "send"}` frames (held in memory and sent after reconnect if the
+// socket is down).
 
 import type { ChannelPlugin } from "openclaw/plugin-sdk";
 import { PrimetaBridge } from "./primeta-bridge.js";
 import { registerBridge, unregisterBridge, getBridge } from "./bridge-registry.js";
 import { handleChatMessage } from "./inbound.js";
+import { defaultOutboxPath } from "./outbox.js";
 
 interface PrimetaConfig {
   enabled?: boolean;
   serverUrl?: string;
   apiKey?: string;
   bridgeName?: string;
+  /** Reply outbox file. Default: ~/.openclaw/primeta/outbox-<accountId>.json */
+  outboxPath?: string;
 }
 
 interface ResolvedAccount {
@@ -87,11 +91,13 @@ export const primetaPlugin: ChannelPlugin<ResolvedAccount> = {
       const id = accountId || "default";
       const messageId = `pm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const bridge = getBridge(id);
-      if (!bridge || !bridge.isConnected()) {
-        console.error(`[primeta] outbound.sendText: no connected bridge for account ${id}`);
+      if (!bridge) {
+        console.error(`[primeta] outbound.sendText: no bridge for account ${id}`);
         return { channel: "primeta", messageId };
       }
-      bridge.sendToServer({ type: "send", text, bridgeName: bridge.bridgeName });
+      if (!bridge.sendMessage(text)) {
+        console.error(`[primeta] outbound.sendText: bridge ${id} offline — queued until reconnect`);
+      }
       return { channel: "primeta", messageId };
     },
   },
@@ -111,6 +117,7 @@ export const primetaPlugin: ChannelPlugin<ResolvedAccount> = {
         serverUrl,
         apiKey,
         bridgeName,
+        outboxPath: config.outboxPath ?? defaultOutboxPath(accountId),
         onChatMessage: (msg) => handleChatMessage(msg, { bridge, account: { accountId } }),
         onConnected: () => ctx.setStatus?.({ accountId, running: true, lastStartAt: Date.now() }),
         onDisconnected: (err) =>

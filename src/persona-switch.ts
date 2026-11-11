@@ -42,11 +42,7 @@ export async function dispatchPersonaSwitchGreeting({
     });
 
     if (buffer.trim().length > 0) {
-      bridge.sendToServer({
-        type: "send",
-        text: buffer,
-        bridgeName: bridge.bridgeName,
-      });
+      bridge.sendMessage(buffer);
       // Greeting is now in the LLM's history — subsequent user turns can
       // ship raw text without prepending the personality again.
       const sessionKey = resolveSessionKey(senderId);
