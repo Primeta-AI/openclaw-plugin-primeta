@@ -356,6 +356,56 @@ test("reply_ack capability is per subscription, not carried across reconnects or
   second.bridge.close();
 });
 
+test("bridge_hello / reply_ack arriving before confirm_subscription is latched and releases held replies on confirm", async () => {
+  const { bridge } = makeBridge();
+  bridge.connect();
+  const ws1 = await subscribe();
+  bridge.sendReply("95", "attempted");
+  ws1.close();
+  mock.timers.tick(1_000);
+  await flush();
+
+  // Server transmits hello from `subscribed` before ActionCable's confirm.
+  const ws2 = lastWs();
+  ws2.readyState = 1;
+  ws2.emit("open");
+  hello(ws2);
+  assert.deepEqual(frames(ws2), [], "nothing is written before confirm_subscription");
+  ws2.emit("message", Buffer.from(JSON.stringify({ type: "confirm_subscription", identifier: IDENT })));
+  assert.deepEqual(frames(ws2), [{ type: "reply", messageId: "95", text: "attempted" }]);
+  ack(ws2, "95", "ok");
+  assert.deepEqual(bridge.pendingReplyIds(), []);
+
+  // An early reply_ack (for an unknown id) latches too.
+  bridge.sendReply("96", "attempted again");
+  const ws3 = await dropAndReconnect(ws2);
+  assert.deepEqual(frames(ws3), [], "latch reset on drop: held until proven");
+  ws3.close();
+  mock.timers.tick(2_000);
+  await flush();
+  const ws4 = lastWs();
+  ws4.readyState = 1;
+  ws4.emit("open");
+  ack(ws4, "unknown", "rejected");
+  ws4.emit("message", Buffer.from(JSON.stringify({ type: "confirm_subscription", identifier: IDENT })));
+  assert.deepEqual(frames(ws4), [{ type: "reply", messageId: "96", text: "attempted again" }]);
+
+  // A latch on a socket that is dropped before confirm does not carry over.
+  bridge.sendReply("97", "third");
+  ws4.close();
+  mock.timers.tick(4_000);
+  await flush();
+  const ws5 = lastWs();
+  ws5.readyState = 1;
+  ws5.emit("open");
+  hello(ws5);
+  ws5.close();
+  mock.timers.tick(8_000);
+  const ws6 = await subscribe();
+  assert.deepEqual(frames(ws6), [], "pre-confirm hello on a dropped socket must not authorize a resend");
+  bridge.close();
+});
+
 test("a reply_ack frame alone proves capability and releases held replies", async () => {
   const { bridge } = makeBridge();
   bridge.connect();

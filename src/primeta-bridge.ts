@@ -101,13 +101,16 @@ const TICKET_MINT_TIMEOUT_MS = 10_000;
 // reply that has already been written once (attempts > 0) is only ever
 // resent on a subscription that has *itself* proven it acks — via the
 // `bridge_hello` frame advertising "reply_ack", or any reply_ack frame.
-// That proof is per subscription: it is reset on every new subscribe and
-// on disconnect, never persisted, because the server behind the URL can
-// change across reconnects and restarts.
+// That proof is per socket: it is reset on socket open, drop and close,
+// never persisted, because the server behind the URL can change across
+// reconnects and restarts. It is latched even when it arrives *before*
+// confirm_subscription (the server may transmit hello from `subscribed`
+// ahead of ActionCable's confirm), and confirm does not clear it.
 //
-// On confirm_subscription only never-sent replies (attempts === 0) go
-// out. Already-attempted replies wait for proof; once it arrives they are
-// resent as the same `{type: "reply", messageId}`. If instead the
+// On confirm_subscription never-sent replies (attempts === 0) go out, and
+// so do already-attempted ones if this socket has already proven reply_ack.
+// Otherwise already-attempted replies wait for proof; once it arrives they
+// are resent as the same `{type: "reply", messageId}`. If instead the
 // subscription is demonstrably live (a ping or other frame arrives at
 // least LEGACY_DETECT_GRACE_MS after confirm) and still no proof, the
 // server is pre-F-09: already-attempted replies are settled as delivered
@@ -143,7 +146,8 @@ export class PrimetaBridge {
   private readonly outbox: ReplyOutbox;
   // At most one ack-timeout or retry timer per pending messageId.
   private readonly replyTimers = new Map<string, NodeJS.Timeout>();
-  // Per-subscription reply_ack capability (see the F-09 note above).
+  // Per-socket reply_ack capability latch (see the F-09 note above). May be
+  // set before confirm_subscription; reset only on open/drop/close.
   private replyAckCapable = false;
   private legacyServer = false;
   private subscribedAt = 0;
@@ -451,6 +455,9 @@ export class PrimetaBridge {
     if (this.replyAckCapable) return;
     this.replyAckCapable = true;
     this.legacyServer = false;
+    // Proof before confirm_subscription: just latch it; flushOutbound()
+    // on confirm will send attempted replies too.
+    if (!this.subscribed) return;
     // Resend held replies — anything already in flight on this
     // subscription still has its ack/retry timer and is left alone.
     for (const { messageId } of this.outbox.list()) {
@@ -509,8 +516,9 @@ export class PrimetaBridge {
   }
 
   /**
-   * After (re)subscribing: send never-attempted replies (already-attempted
-   * ones wait for this subscription to prove reply_ack), then held sends.
+   * After (re)subscribing: send never-attempted replies, plus
+   * already-attempted ones if this socket has already proven reply_ack
+   * (else they wait for proof), then held sends.
    */
   private flushOutbound(): void {
     for (const { messageId } of this.outbox.list()) this.transmitReply(messageId);
@@ -559,6 +567,8 @@ export class PrimetaBridge {
         this.noteLiveServerFrame();
         return;
       case "confirm_subscription":
+        // Deliberately does not reset replyAckCapable: a hello/reply_ack
+        // that raced ahead of this confirm on the same socket still counts.
         this.subscribed = true;
         this.subscribedAt = Date.now();
         this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
