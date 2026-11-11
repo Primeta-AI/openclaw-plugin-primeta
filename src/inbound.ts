@@ -1,7 +1,8 @@
 // Handles an incoming `chat_message` frame from Primeta: prepends the
 // persona's personality on the first turn of a session (so the LLM's
 // history anchors to it), dispatches the turn, and ships the buffered
-// reply back as a single `{type: "reply"}` frame. Subsequent turns in
+// reply back as a single `{type: "reply"}` frame via the bridge's durable
+// outbox (resent with the same messageId until the server acks it). Subsequent turns in
 // the same session ship raw user text — the `before_prompt_build` hook
 // in index.ts re-injects the personality as a cacheable system prefix,
 // and the LLM's own history keeps the character established.
@@ -50,11 +51,7 @@ export async function handleChatMessage(
       deliver: (chunk) => { buffer += chunk; },
     });
 
-    bridge.sendToServer({
-      type: "reply",
-      messageId: msg.messageId,
-      text: buffer,
-    });
+    bridge.sendReply(msg.messageId, buffer);
 
     // Turn succeeded — the LLM has seen this personality either via the
     // body prepend (this turn) or via prior history. Mark established so
@@ -62,10 +59,6 @@ export async function handleChatMessage(
     if (msg.personality) markEstablished(sessionKey);
   } catch (err) {
     console.error("[primeta] chat_message dispatch failed:", err);
-    bridge.sendToServer({
-      type: "reply",
-      messageId: msg.messageId,
-      text: `[OpenClaw error: ${(err as Error).message}]`,
-    });
+    bridge.sendReply(msg.messageId, `[OpenClaw error: ${(err as Error).message}]`);
   }
 }

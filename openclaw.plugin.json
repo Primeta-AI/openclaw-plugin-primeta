@@ -11,7 +11,8 @@
           "enabled": { "type": "boolean" },
           "serverUrl": { "type": "string", "format": "uri" },
           "apiKey": { "type": "string" },
-          "bridgeName": { "type": "string" }
+          "bridgeName": { "type": "string" },
+          "outboxPath": { "type": "string" }
         },
         "required": ["serverUrl", "apiKey"]
       }
