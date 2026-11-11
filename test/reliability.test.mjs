@@ -97,6 +97,28 @@ function ack(ws, messageId, status, reason) {
   serverSays(ws, { type: "reply_ack", messageId, status, ...(reason ? { reason } : {}) });
 }
 
+/** F-09 server's post-subscribe capability frame. */
+function hello(ws, features = ["reply_ack"]) {
+  serverSays(ws, { type: "bridge_hello", features });
+}
+
+/** ActionCable heartbeat (bare protocol frame). */
+function ping(ws) {
+  ws.emit("message", Buffer.from(JSON.stringify({ type: "ping", message: Date.now() })));
+}
+
+/** Simulate a live socket for `ms`: a ping every 3s, like ActionCable. */
+function pingFor(ws, ms) {
+  for (let t = 0; t < ms; t += 3_000) {
+    mock.timers.tick(3_000);
+    ping(ws);
+  }
+}
+
+function replyFrames(...sockets) {
+  return sockets.flatMap(frames).filter((f) => f.type === "reply");
+}
+
 function persisted() {
   const p = join(dir, "outbox.json");
   if (!existsSync(p)) return [];
@@ -128,7 +150,7 @@ test("reply produced while disconnected is persisted and replayed after confirm_
   bridge.close();
 });
 
-test("reply lost to a disconnect is resent with the same messageId on reconnect", async () => {
+test("reply lost to a disconnect is resent (same messageId) only once the new subscription proves reply_ack", async () => {
   const { bridge } = makeBridge();
   bridge.connect();
   const ws1 = await subscribe();
@@ -137,6 +159,10 @@ test("reply lost to a disconnect is resent with the same messageId on reconnect"
 
   const ws2 = await dropAndReconnect(ws1);
   assert.notEqual(ws1, ws2);
+  assert.deepEqual(frames(ws2), [], "already-attempted reply is held until the server proves it acks");
+  assert.deepEqual(bridge.pendingReplyIds(), ["7"]);
+
+  hello(ws2);
   assert.deepEqual(frames(ws2), [{ type: "reply", messageId: "7", text: "first try" }]);
 
   ack(ws2, "7", "ok");
@@ -218,15 +244,131 @@ test("no ack from an ack-capable server resends the same reply after the timeout
   bridge.close();
 });
 
-test("a server that never sends reply_ack is not double-posted", async () => {
+test("a live server that never sends hello/reply_ack is not double-posted (no-ack 15s)", async () => {
   const { bridge } = makeBridge();
   bridge.connect();
   const ws = await subscribe();
   bridge.sendReply("3", "legacy");
-  mock.timers.tick(15_000);
+  pingFor(ws, 15_000);
+  assert.deepEqual(bridge.pendingReplyIds(), [], "settled as delivered on a live pre-F-09 subscription");
+  assert.deepEqual(persisted(), []);
+  pingFor(ws, 120_000);
+  assert.equal(bridge.isConnected(), true);
+  assert.deepEqual(frames(ws), [{ type: "reply", messageId: "3", text: "legacy" }]);
+  bridge.close();
+});
+
+test("pre-F-09 server (confirm + pings, no hello, no ack) gets exactly one reply across reconnects and a restart", async () => {
+  const first = makeBridge();
+  first.bridge.connect();
+  const ws1 = await subscribe();
+  first.bridge.sendReply("50", "once");
+  // Socket dies before any ping proves the server live.
+  const ws2 = await dropAndReconnect(ws1);
+  assert.deepEqual(frames(ws2), [], "no resend without proof of reply_ack");
+  ping(ws2); // inside the hello grace window — not yet proof of a legacy server
+  const ws3 = await dropAndReconnect(ws2, 2_000);
+  assert.deepEqual(frames(ws3), []);
+  assert.deepEqual(first.bridge.pendingReplyIds(), ["50"]);
+  first.bridge.close();
+
+  // Process restart: the attempted entry is reloaded from disk...
+  const second = makeBridge();
+  assert.deepEqual(second.bridge.pendingReplyIds(), ["50"]);
+  second.bridge.connect();
+  const ws4 = await subscribe();
+  assert.deepEqual(frames(ws4), [], "attempted entry is not blindly resent after restart");
+  // ...and settled as delivered once the legacy server is shown to be live.
+  pingFor(ws4, 30_000);
+  assert.deepEqual(second.bridge.pendingReplyIds(), []);
+  assert.deepEqual(persisted(), []);
+
+  const ws5 = await dropAndReconnect(ws4);
+  pingFor(ws5, 30_000);
+  const all = replyFrames(ws1, ws2, ws3, ws4, ws5);
+  assert.deepEqual(all, [{ type: "reply", messageId: "50", text: "once" }]);
+  assert.ok(![ws1, ws2, ws3, ws4, ws5].flatMap(frames).some((f) => f.type === "send"), "never converted to send");
+  second.bridge.close();
+});
+
+test("first reply on a socket that dies before hello/ack stays pending and is resent after a hello-capable subscribe", async () => {
+  const { bridge, disconnects } = makeBridge();
+  bridge.connect();
+  const ws1 = await subscribe();
+  bridge.sendReply("60", "dead socket");
+  mock.timers.tick(15_000); // ack timeout, no frames at all
+  assert.deepEqual(bridge.pendingReplyIds(), ["60"], "not settled as delivered on a possibly-dead socket");
+  mock.timers.tick(5_000); // watchdog fires
+  assert.equal(disconnects.length, 1);
+  assert.deepEqual(bridge.pendingReplyIds(), ["60"]);
+  assert.deepEqual(persisted(), ["60"]);
+
+  mock.timers.tick(1_000);
+  const ws2 = await subscribe();
+  assert.deepEqual(frames(ws2), []);
+  hello(ws2);
+  assert.deepEqual(frames(ws2), [{ type: "reply", messageId: "60", text: "dead socket" }]);
+  ack(ws2, "60", "ok");
   assert.deepEqual(bridge.pendingReplyIds(), []);
-  mock.timers.tick(120_000);
-  assert.equal(frames(ws).length, 1);
+  bridge.close();
+});
+
+test("a ping racing ahead of the hello broadcast does not settle a pending reply", async () => {
+  const { bridge } = makeBridge();
+  bridge.connect();
+  const ws1 = await subscribe();
+  bridge.sendReply("70", "race");
+  const ws2 = await dropAndReconnect(ws1);
+  mock.timers.tick(500);
+  ping(ws2); // arrives before the hello broadcast
+  hello(ws2);
+  assert.deepEqual(frames(ws2), [{ type: "reply", messageId: "70", text: "race" }]);
+  pingFor(ws2, 30_000);
+  assert.deepEqual(bridge.pendingReplyIds(), ["70"], "ack-capable: still waiting for the ack");
+  bridge.close();
+});
+
+test("reply_ack capability is per subscription, not carried across reconnects or restarts", async () => {
+  const first = makeBridge();
+  first.bridge.connect();
+  const ws1 = await subscribe();
+  hello(ws1);
+  first.bridge.sendReply("80", "x");
+  const ws2 = await dropAndReconnect(ws1);
+  // Now a pre-F-09 server answers (e.g. rollback): no hello, just pings.
+  pingFor(ws2, 6_000);
+  assert.deepEqual(frames(ws2), [], "hello on an earlier socket does not authorize a resend");
+  assert.deepEqual(first.bridge.pendingReplyIds(), []);
+  first.bridge.close();
+
+  // Restart with an attempted entry on disk and a hello without reply_ack.
+  writeFileSync(join(dir, "outbox.json"), JSON.stringify({
+    version: 1,
+    replies: [{ messageId: "81", text: "y", createdAt: Date.now(), attempts: 1 }],
+  }));
+  const second = makeBridge();
+  second.bridge.connect();
+  const ws3 = await subscribe();
+  hello(ws3, []);
+  pingFor(ws3, 6_000);
+  assert.deepEqual(frames(ws3), []);
+  assert.deepEqual(second.bridge.pendingReplyIds(), []);
+  second.bridge.close();
+});
+
+test("a reply_ack frame alone proves capability and releases held replies", async () => {
+  const { bridge } = makeBridge();
+  bridge.connect();
+  const ws1 = await subscribe();
+  bridge.sendReply("90", "held");
+  const ws2 = await dropAndReconnect(ws1);
+  bridge.sendReply("91", "fresh");
+  assert.deepEqual(frames(ws2), [{ type: "reply", messageId: "91", text: "fresh" }]);
+  ack(ws2, "91", "ok");
+  assert.deepEqual(frames(ws2), [
+    { type: "reply", messageId: "91", text: "fresh" },
+    { type: "reply", messageId: "90", text: "held" },
+  ]);
   bridge.close();
 });
 

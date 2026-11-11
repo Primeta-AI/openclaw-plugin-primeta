@@ -37,6 +37,9 @@ interface ReplyAckFrame {
 
 const REPLY_ACK_STATUSES = new Set(["ok", "retry", "rejected"]);
 
+/** Feature flag in the server's post-subscribe `bridge_hello` frame. */
+const REPLY_ACK_FEATURE = "reply_ack";
+
 export type LogLevel = "info" | "warn" | "error";
 
 export interface PrimetaBridgeOptions {
@@ -91,15 +94,33 @@ const TICKET_MINT_TIMEOUT_MS = 10_000;
 
 // Reply delivery (F-09). Every correlated reply stays in the outbox until
 // the server answers with reply_ack ok/rejected. `retry` (transient save
-// failure) resends the same frame after a backoff; no ack within
-// REPLY_ACK_TIMEOUT_MS resends too — but only once this process has seen
-// the server send a reply_ack at all. A server that predates reply_ack
-// never acks, and resending to it would double-post (it turns unmatched
-// replies into unsolicited messages), so against such a server an
-// unacked reply is treated as delivered after the timeout, exactly like
-// the old fire-and-forget behaviour. The outbox is flushed (same
-// messageId) after every confirm_subscription.
+// failure) resends the same frame after a backoff.
+//
+// A server that predates reply_ack never acks, and a resend to it would
+// double-post (it turns unmatched replies into unsolicited messages). So a
+// reply that has already been written once (attempts > 0) is only ever
+// resent on a subscription that has *itself* proven it acks — via the
+// `bridge_hello` frame advertising "reply_ack", or any reply_ack frame.
+// That proof is per subscription: it is reset on every new subscribe and
+// on disconnect, never persisted, because the server behind the URL can
+// change across reconnects and restarts.
+//
+// On confirm_subscription only never-sent replies (attempts === 0) go
+// out. Already-attempted replies wait for proof; once it arrives they are
+// resent as the same `{type: "reply", messageId}`. If instead the
+// subscription is demonstrably live (a ping or other frame arrives at
+// least LEGACY_DETECT_GRACE_MS after confirm) and still no proof, the
+// server is pre-F-09: already-attempted replies are settled as delivered
+// (dropped, never resent, never converted to `send`), matching the old
+// fire-and-forget behaviour. The grace covers the hello broadcast
+// arriving a moment after confirm on an ack-capable server.
+//
+// No-ack timeout: on an ack-capable subscription the reply is resent
+// after REPLY_ACK_TIMEOUT_MS. Without proof the timeout does nothing —
+// the socket may be dead, in which case the watchdog reconnects and a
+// later hello-capable subscription resends it.
 const REPLY_ACK_TIMEOUT_MS = 15_000;
+const LEGACY_DETECT_GRACE_MS = 2_000;
 const REPLY_RETRY_BASE_MS = 1_000;
 const REPLY_RETRY_MAX_MS = 30_000;
 const MAX_REPLY_ATTEMPTS = 10;
@@ -122,7 +143,10 @@ export class PrimetaBridge {
   private readonly outbox: ReplyOutbox;
   // At most one ack-timeout or retry timer per pending messageId.
   private readonly replyTimers = new Map<string, NodeJS.Timeout>();
-  private serverAcksReplies = false;
+  // Per-subscription reply_ack capability (see the F-09 note above).
+  private replyAckCapable = false;
+  private legacyServer = false;
+  private subscribedAt = 0;
   private pendingSends: string[] = [];
 
   constructor(private readonly opts: PrimetaBridgeOptions) {
@@ -252,6 +276,7 @@ export class PrimetaBridge {
       this.log("info", `Connected to ${this.opts.serverUrl}`);
       this.lastInboundAt = Date.now();
       this.startHeartbeatWatchdog();
+      this.resetReplyAckCapability();
       ws.send(JSON.stringify({ command: "subscribe", identifier: this.channelIdentifier }));
     });
 
@@ -284,6 +309,7 @@ export class PrimetaBridge {
     if (ws !== this.ws) return;
     this.ws = null;
     this.subscribed = false;
+    this.resetReplyAckCapability();
     this.stopHeartbeatWatchdog();
     this.clearReplyTimers();
     detachSocket(ws);
@@ -304,6 +330,7 @@ export class PrimetaBridge {
     const ws = this.ws;
     this.ws = null;
     this.subscribed = false;
+    this.resetReplyAckCapability();
     if (ws) {
       detachSocket(ws);
       try { ws.close(); } catch {}
@@ -385,6 +412,9 @@ export class PrimetaBridge {
     this.clearReplyTimer(messageId);
     const entry = this.outbox.get(messageId);
     if (!entry || !this.isConnected()) return; // flushed on next subscribe
+    // Already written once: only resend where the server can ack (and so
+    // dedupe by messageId). Held until hello/ack or legacy detection.
+    if (entry.attempts > 0 && !this.replyAckCapable) return;
     if (entry.attempts >= MAX_REPLY_ATTEMPTS) {
       this.log("error", `reply ${messageId} not acknowledged after ${entry.attempts} attempts — dropping`);
       this.outbox.remove(messageId);
@@ -392,23 +422,70 @@ export class PrimetaBridge {
     }
     if (!this.sendToServer({ type: "reply", messageId, text: entry.text })) return;
     this.outbox.markAttempt(messageId);
+    if (this.legacyServer) {
+      // Pre-F-09 server on this live subscription: fire-and-forget.
+      this.outbox.remove(messageId);
+      return;
+    }
     this.setReplyTimer(messageId, REPLY_ACK_TIMEOUT_MS, () => this.onReplyAckTimeout(messageId));
   }
 
   private onReplyAckTimeout(messageId: string): void {
     if (!this.outbox.has(messageId)) return;
-    if (!this.serverAcksReplies) {
-      // Pre-F-09 server: never acks, and would double-post a resend.
-      this.log("warn", `no reply_ack for ${messageId} (server does not ack replies) — treating as delivered`);
-      this.outbox.remove(messageId);
-      return;
-    }
+    // Without proof of ack support the socket may simply be dead: leave the
+    // entry pending (no resend, no settle). Legacy detection or a later
+    // hello-capable subscription decides its fate.
+    if (!this.replyAckCapable) return;
     this.log("warn", `no reply_ack for ${messageId} — resending`);
     this.transmitReply(messageId);
   }
 
+  private resetReplyAckCapability(): void {
+    this.replyAckCapable = false;
+    this.legacyServer = false;
+    this.subscribedAt = 0;
+  }
+
+  /** This subscription has proven it acks replies (hello or a reply_ack). */
+  private markReplyAckCapable(): void {
+    if (this.replyAckCapable) return;
+    this.replyAckCapable = true;
+    this.legacyServer = false;
+    // Resend held replies — anything already in flight on this
+    // subscription still has its ack/retry timer and is left alone.
+    for (const { messageId } of this.outbox.list()) {
+      if (!this.replyTimers.has(messageId)) this.transmitReply(messageId);
+    }
+  }
+
+  /**
+   * A live frame arrived on this subscription. If the grace period has
+   * passed with no hello/ack, the server is pre-F-09: settle replies that
+   * were already written (they reached a live legacy server earlier, or
+   * will never be acked) instead of resending them.
+   */
+  private noteLiveServerFrame(): void {
+    if (!this.subscribed || this.replyAckCapable) return;
+    if (!this.legacyServer) {
+      if (Date.now() - this.subscribedAt < LEGACY_DETECT_GRACE_MS) return;
+      this.legacyServer = true;
+      this.log("info", "server did not advertise reply_ack — treating replies as fire-and-forget");
+    }
+    for (const entry of this.outbox.list()) {
+      if (entry.attempts === 0) continue;
+      this.clearReplyTimer(entry.messageId);
+      this.outbox.remove(entry.messageId);
+    }
+  }
+
   private handleReplyAck(ack: ReplyAckFrame): void {
-    this.serverAcksReplies = true;
+    // Settle this ack first so proving capability can't resend the very
+    // reply being acked.
+    this.applyReplyAck(ack);
+    this.markReplyAckCapable();
+  }
+
+  private applyReplyAck(ack: ReplyAckFrame): void {
     const entry = this.outbox.get(ack.messageId);
     if (!entry) return; // already settled (duplicate ack)
     this.clearReplyTimer(ack.messageId);
@@ -431,7 +508,10 @@ export class PrimetaBridge {
     }
   }
 
-  /** After (re)subscribing: resend every unacked reply, then held sends. */
+  /**
+   * After (re)subscribing: send never-attempted replies (already-attempted
+   * ones wait for this subscription to prove reply_ack), then held sends.
+   */
   private flushOutbound(): void {
     for (const { messageId } of this.outbox.list()) this.transmitReply(messageId);
     const sends = this.pendingSends;
@@ -476,9 +556,11 @@ export class PrimetaBridge {
         return;
       case "ping":
         this.sendToServer({ type: "pong" });
+        this.noteLiveServerFrame();
         return;
       case "confirm_subscription":
         this.subscribed = true;
+        this.subscribedAt = Date.now();
         this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
         this.log("info", "Subscribed to BridgeChannel");
         this.opts.onConnected?.();
@@ -495,6 +577,15 @@ export class PrimetaBridge {
     // Application frames (channel-identifier-wrapped)
     if (frame.identifier && frame.message) {
       const msg = frame.message;
+      if (msg?.type === "bridge_hello") {
+        if (Array.isArray(msg.features) && msg.features.includes(REPLY_ACK_FEATURE)) {
+          this.markReplyAckCapable();
+        } else {
+          this.noteLiveServerFrame();
+        }
+        return;
+      }
+      if (msg?.type !== "reply_ack") this.noteLiveServerFrame();
       if (msg?.type === "chat_message" && typeof msg.messageId === "string") {
         this.runOnChatMessage(msg as ChatMessageFrame);
       } else if (msg?.type === "persona_update" && typeof msg.personality === "string") {

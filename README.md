@@ -109,6 +109,14 @@ On the first turn of a session, the plugin prepends the `personality` to the use
 
 The plugin refreshes its cached personality and dispatches a short "greet as new persona" turn so the LLM adopts the switch in conversation history rather than drifting back to the prior character.
 
+**`bridge_hello`** — sent by the server right after a successful subscribe.
+
+```json
+{ "type": "bridge_hello", "features": ["reply_ack"] }
+```
+
+`"reply_ack"` in `features` (or any `reply_ack` frame) proves that this subscription acks replies. The plugin keeps that per subscription only: it is reset on every reconnect and never persisted.
+
 **`reply_ack`** — the server's verdict on a `reply` frame.
 
 ```json
@@ -127,7 +135,7 @@ The plugin refreshes its cached personality and dispatches a short "greet as new
 { "type": "reply", "messageId": "pm-...", "text": "<full response>" }
 ```
 
-Replies go through a durable outbox, deduplicated by `messageId` (the first reply for an id wins). A reply stays in the outbox until the server answers `reply_ack` `ok` or `rejected`. It is flushed, with the same `messageId`, after every `confirm_subscription`, so replies produced while offline or lost in a disconnect are delivered after the reconnect. If no `reply_ack` arrives within 15s and the server has acked replies before, the plugin resends the reply. A server that predates `reply_ack` never acks, so against it the plugin treats an unacked reply as delivered after 15s and does not resend it (resending would post it twice).
+Replies go through a durable outbox, deduplicated by `messageId` (the first reply for an id wins). A reply stays in the outbox until the server answers `reply_ack` `ok` or `rejected`. After every `confirm_subscription` the plugin sends replies that have never been written to a socket. A reply that has already been sent once is resent (same `type: "reply"`, same `messageId`) only after the current subscription proves it supports `reply_ack`. On an ack-capable subscription, a reply with no ack within 15s is resent. A server that predates `reply_ack` never acks, and a resend would post the reply twice. So once a subscription is clearly live (an ActionCable ping arrives more than 2s after confirm) and has sent no hello or ack, the plugin treats replies it has already sent as delivered and drops them. If a socket dies before either signal, the reply stays pending; it is never treated as delivered just because 15s passed.
 
 The outbox is persisted to `~/.openclaw/primeta/outbox-<accountId>.json` (mode 0600, because it holds reply text). Set `outboxPath` to change the location. Entries older than 24h are discarded on load. If the file can't be written, the outbox keeps working in memory and logs a warning.
 
