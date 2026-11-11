@@ -37,6 +37,23 @@ export interface PrimetaBridgeOptions {
   onConnected?: () => void;
   onDisconnected?: (err?: Error) => void;
   log?: (level: LogLevel, msg: string) => void;
+  /** Test seam — defaults to global fetch. */
+  fetchImpl?: typeof fetch;
+  /** Test seam — defaults to the `ws` WebSocket client. */
+  webSocketImpl?: WebSocketFactory;
+}
+
+export type WebSocketFactory = new (
+  url: string,
+  options: { headers: Record<string, string> },
+) => WebSocket;
+
+/** Error raised when the server refuses to mint a cable ticket. */
+export class CableTicketError extends Error {
+  constructor(message: string, readonly status?: number) {
+    super(message);
+    this.name = "CableTicketError";
+  }
 }
 
 const INITIAL_RECONNECT_DELAY_MS = 1_000;
@@ -50,6 +67,13 @@ const MAX_RECONNECT_DELAY_MS = 30_000;
 const HEARTBEAT_TIMEOUT_MS = 15_000;
 const HEARTBEAT_CHECK_INTERVAL_MS = 5_000;
 
+// Cable tickets (POST /cable/tickets) are one-time and live for 60s, so we
+// mint one immediately before every WebSocket open and never reuse them.
+// The long-lived apiKey only ever travels in the Authorization header of
+// that POST — never in the cable URL, where it would land in proxy and
+// server access logs.
+const TICKET_MINT_TIMEOUT_MS = 10_000;
+
 export class PrimetaBridge {
   private ws: WebSocket | null = null;
   private reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
@@ -59,6 +83,9 @@ export class PrimetaBridge {
   private reconnecting = false;
   private closed = false;
   private subscribed = false;
+  // Bumped on every connect()/close() so an in-flight ticket mint that
+  // resolves after the bridge was closed (or re-connected) is discarded.
+  private connectAttempt = 0;
   private readonly channelIdentifier: string;
 
   constructor(private readonly opts: PrimetaBridgeOptions) {
@@ -80,10 +107,87 @@ export class PrimetaBridge {
   connect(): void {
     this.closed = false;
     this.reconnecting = false;
+    const attempt = ++this.connectAttempt;
+    void this.openWithFreshTicket(attempt);
+  }
 
+  private async openWithFreshTicket(attempt: number): Promise<void> {
+    let ticket: string;
+    try {
+      ticket = await this.mintTicket();
+    } catch (err) {
+      if (this.isStale(attempt)) return;
+      const error = err instanceof Error ? err : new Error(String(err));
+      // Deliberately no fallback to ?bridge_token= — the apiKey must never
+      // appear in a URL. Back off and mint again on the next attempt.
+      this.log("error", `Cable ticket mint failed: ${error.message}`);
+      this.opts.onDisconnected?.(error);
+      this.scheduleReconnect();
+      return;
+    }
+    if (this.isStale(attempt)) return;
+    this.openSocket(ticket);
+  }
+
+  private isStale(attempt: number): boolean {
+    return this.closed || attempt !== this.connectAttempt;
+  }
+
+  private async mintTicket(): Promise<string> {
+    const fetchImpl = this.opts.fetchImpl ?? globalThis.fetch;
+    if (typeof fetchImpl !== "function") {
+      throw new CableTicketError("global fetch is unavailable (Node >= 18 required)");
+    }
+
+    const url = this.ticketUrl();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TICKET_MINT_TIMEOUT_MS);
+    timer.unref?.();
+
+    let res: Response;
+    try {
+      res = await fetchImpl(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.opts.apiKey}`,
+          Accept: "application/json",
+        },
+        // Never follow redirects with the bearer token attached.
+        redirect: "error",
+        signal: controller.signal,
+      });
+    } catch (err) {
+      const reason = controller.signal.aborted ? "timed out" : (err as Error).message;
+      throw new CableTicketError(`request failed: ${reason}`);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (res.status === 401 || res.status === 403) {
+      throw new CableTicketError(`unauthorized (HTTP ${res.status}) — check apiKey`, res.status);
+    }
+    if (!res.ok) {
+      throw new CableTicketError(`unexpected HTTP ${res.status}`, res.status);
+    }
+
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      throw new CableTicketError("response was not valid JSON", res.status);
+    }
+    const ticket = (body as { ticket?: unknown } | null)?.ticket;
+    if (typeof ticket !== "string" || ticket.length === 0) {
+      throw new CableTicketError("response did not include a ticket", res.status);
+    }
+    return ticket;
+  }
+
+  private openSocket(ticket: string): void {
+    const WebSocketImpl = this.opts.webSocketImpl ?? WebSocket;
     let ws: WebSocket;
     try {
-      ws = new WebSocket(this.wsUrl(), { headers: { Origin: this.origin() } });
+      ws = new WebSocketImpl(this.wsUrl(ticket), { headers: { Origin: this.origin() } });
     } catch (err) {
       this.log("error", `WebSocket construction failed: ${(err as Error).message}`);
       this.scheduleReconnect();
@@ -121,6 +225,7 @@ export class PrimetaBridge {
 
   close(): void {
     this.closed = true;
+    this.connectAttempt++;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -246,9 +351,26 @@ export class PrimetaBridge {
     }
   }
 
-  private wsUrl(): string {
-    const base = this.opts.serverUrl.replace(/\/$/, "").replace(/^http/, "ws");
-    return `${base}/cable?bridge_token=${encodeURIComponent(this.opts.apiKey)}`;
+  private ticketUrl(): string {
+    return `${this.httpBase()}/cable/tickets`;
+  }
+
+  private wsUrl(ticket: string): string {
+    const base = this.httpBase().replace(/^http/i, "ws");
+    return `${base}/cable?ticket=${encodeURIComponent(ticket)}`;
+  }
+
+  // Only http(s) server URLs are accepted; anything else would make the
+  // ws-scheme rewrite below meaningless and could send the bearer token
+  // somewhere unexpected.
+  private httpBase(): string {
+    const base = this.opts.serverUrl.replace(/\/$/, "");
+    if (!/^https?:\/\//i.test(base)) {
+      // Report only the scheme — the URL itself may embed credentials.
+      const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(base)?.[1] ?? "none";
+      throw new CableTicketError(`serverUrl must start with http:// or https:// (got scheme "${scheme}")`);
+    }
+    return base;
   }
 
   // Rails' ActionCable enforces `allowed_request_origins` in production.

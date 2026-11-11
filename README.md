@@ -62,6 +62,15 @@ Restart the OpenClaw gateway after configuring. An **OpenClaw** channel card wil
 
 The plugin dials out from the OpenClaw gateway to Primeta — Primeta runs remotely, so it can't reach your local gateway directly. Authentication uses the Primeta API token you pass to `init`.
 
+The API token never appears in a URL. Before each WebSocket connect (including every reconnect), the plugin trades it for a one-time cable ticket:
+
+1. `POST {serverUrl}/cable/tickets` with `Authorization: Bearer <apiKey>` → `201 {"ticket": "…", "expires_in": 60}`
+2. Open `{wsServerUrl}/cable?ticket=<ticket>` with `Origin: <serverUrl>`
+
+Tickets are single-use and expire after 60 seconds, so they are never cached or reused. If minting fails (bad token, network error, server error), the plugin backs off and tries again; it does **not** fall back to putting the token in the cable URL.
+
+> **Compatibility:** this requires a Primeta server with `POST /cable/tickets` (deployed before this plugin release). Older plugin versions that connect with `/cable?bridge_token=` keep working, because the server still accepts that legacy parameter during the transition.
+
 When Primeta forwards a user message, the plugin runs one turn through OpenClaw's reply pipeline (`dispatchReplyWithBufferedBlockDispatcher`), buffers the output, and sends a single reply frame back over the socket. Personas are injected as a cacheable system-prompt prefix via the `before_prompt_build` hook, so the agent stays in character across turns without re-shipping the full personality on every message.
 
 ## Protocol
@@ -166,6 +175,7 @@ src/
 npm install
 npm run build           # tsc → dist/
 npm run dev             # tsc --watch
+npm test                # build, then node:test unit tests (Node >= 20.4 for mock timers)
 ```
 
 To load from a local checkout during development, pass `--path` to the init command:
